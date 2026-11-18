@@ -7,7 +7,11 @@ const path = require('path');
 const PORT = process.env.PORT || 3000;
 const SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+const GOOGLE_ID = process.env.GOOGLE_CLIENT_ID || '';
+const GOOGLE_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
+const BASE_URL = (process.env.BASE_URL || 'https://vzf-status.onrender.com').replace(/\/$/, '');
+const crypto = require('crypto');
+const fs = require('fs');
 const STATUSES = ['process', 'done', 'pause', 'cancel'];
 
 function makePool() {
@@ -28,11 +32,10 @@ async function init() {
   await q(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, pass_hash TEXT NOT NULL, role TEXT NOT NULL, client_id INTEGER)`);
   await q(`CREATE TABLE IF NOT EXISTS projects (id SERIAL PRIMARY KEY, client_id INTEGER NOT NULL, title TEXT NOT NULL, stages TEXT NOT NULL DEFAULT '{}', note TEXT NOT NULL DEFAULT '', updated_at BIGINT NOT NULL, updated_by TEXT NOT NULL DEFAULT '')`);
   await q(`CREATE TABLE IF NOT EXISTS requests (id SERIAL PRIMARY KEY, client_id INTEGER NOT NULL, title TEXT NOT NULL, details TEXT NOT NULL DEFAULT '', created_at BIGINT NOT NULL)`);
-  if (ADMIN_EMAIL && ADMIN_PASSWORD) {
+  if (ADMIN_EMAIL) {
     const r = await q('SELECT id FROM users WHERE email=$1', [ADMIN_EMAIL]);
-    const h = await bcrypt.hash(ADMIN_PASSWORD, 10);
-    if (r.rows.length) await q('UPDATE users SET pass_hash=$1, role=$2 WHERE email=$3', [h, 'owner', ADMIN_EMAIL]);
-    else await q('INSERT INTO users(name,email,pass_hash,role) VALUES($1,$2,$3,$4)', ['Owner', ADMIN_EMAIL, h, 'owner']);
+    if (r.rows.length) await q('UPDATE users SET role=$1 WHERE email=$2', ['owner', ADMIN_EMAIL]);
+    else await q('INSERT INTO users(name,email,pass_hash,role) VALUES($1,$2,$3,$4)', ['Owner', ADMIN_EMAIL, '', 'owner']);
   }
 }
 
@@ -58,22 +61,34 @@ const staffOnly = (req, res, next) => isStaff(req.user) ? next() : res.status(40
 const ownerOnly = (req, res, next) => req.user.role === 'owner' ? next() : res.status(403).json({ error: 'owner only' });
 const wrap = fn => (req, res) => fn(req, res).catch(e => { console.error(e); res.status(500).json({ error: 'server' }); });
 
-// simple login throttle
-const fails = new Map();
-app.post('/api/login', wrap(async (req, res) => {
-  const email = String(req.body.email || '').trim().toLowerCase();
-  const key = req.ip + '|' + email;
-  const f = fails.get(key) || { n: 0, t: Date.now() };
-  if (Date.now() - f.t > 15 * 60e3) { f.n = 0; f.t = Date.now(); }
-  if (f.n >= 8) return res.status(429).json({ error: 'many' });
-  const r = await q('SELECT * FROM users WHERE email=$1', [email]);
-  const u = r.rows[0];
-  const ok = u && await bcrypt.compare(String(req.body.password || ''), u.pass_hash);
-  if (!ok) { f.n++; fails.set(key, f); return res.status(401).json({ error: 'bad' }); }
-  fails.delete(key);
-  const token = jwt.sign({ id: u.id }, SECRET, { expiresIn: '30d' });
+function setSession(res, id) {
+  const token = jwt.sign({ id }, SECRET, { expiresIn: '30d' });
   res.setHeader('Set-Cookie', `vzf=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${30 * 86400}`);
-  res.json({ ok: true });
+}
+app.get('/auth/google', (req, res) => {
+  if (!GOOGLE_ID) return res.status(500).send('Google login is not set up yet.');
+  const state = crypto.randomBytes(16).toString('hex');
+  const params = new URLSearchParams({ client_id: GOOGLE_ID, redirect_uri: BASE_URL + '/auth/google/callback', response_type: 'code', scope: 'openid email profile', state, prompt: 'select_account' });
+  res.setHeader('Set-Cookie', `vzf_state=${state}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=600`);
+  res.redirect('https://accounts.google.com/o/oauth2/v2/auth?' + params.toString());
+});
+app.get('/auth/google/callback', wrap(async (req, res) => {
+  const { code, state } = req.query;
+  if (!code || !state || state !== cookie(req, 'vzf_state')) return res.redirect('/?login=failed');
+  const tr = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ code: String(code), client_id: GOOGLE_ID, client_secret: GOOGLE_SECRET, redirect_uri: BASE_URL + '/auth/google/callback', grant_type: 'authorization_code' })
+  });
+  const tok = await tr.json();
+  if (!tok.id_token) return res.redirect('/?login=failed');
+  // id_token came straight from Google over TLS in exchange for our one-time code
+  const claims = JSON.parse(Buffer.from(tok.id_token.split('.')[1], 'base64url').toString());
+  const email = String(claims.email || '').toLowerCase();
+  if (!email || claims.email_verified !== true || claims.aud !== GOOGLE_ID) return res.redirect('/?login=failed');
+  const r = await q('SELECT id FROM users WHERE email=$1', [email]);
+  if (!r.rows.length) return res.redirect('/?login=denied');
+  setSession(res, r.rows[0].id);
+  res.redirect('/');
 }));
 app.post('/api/logout', (req, res) => {
   res.setHeader('Set-Cookie', 'vzf=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0');
@@ -148,14 +163,13 @@ app.post('/api/clients', auth, ownerOnly, wrap(async (req, res) => {
 app.post('/api/users', auth, ownerOnly, wrap(async (req, res) => {
   const name = String(req.body.name || '').trim().slice(0, 80);
   const email = String(req.body.email || '').trim().toLowerCase();
-  const password = String(req.body.password || '');
   const role = req.body.role === 'lead' ? 'lead' : 'client';
   const clientId = role === 'client' ? Number(req.body.clientId) : null;
-  if (!name || !email || password.length < 6 || (role === 'client' && !clientId)) return res.status(400).json({ error: 'missing' });
-  const exists = await q('SELECT id FROM users WHERE email=$1', [email]);
-  const h = await bcrypt.hash(password, 10);
-  if (exists.rows.length) await q('UPDATE users SET name=$1,pass_hash=$2,role=$3,client_id=$4 WHERE email=$5', [name, h, role, clientId, email]);
-  else await q('INSERT INTO users(name,email,pass_hash,role,client_id) VALUES($1,$2,$3,$4,$5)', [name, email, h, role, clientId]);
+  if (!name || !/^[^@\s]+@[^@\s]+$/.test(email) || (role === 'client' && !clientId)) return res.status(400).json({ error: 'missing' });
+  const exists = await q('SELECT id,role FROM users WHERE email=$1', [email]);
+  if (exists.rows.length && exists.rows[0].role === 'owner') return res.status(400).json({ error: 'owner' });
+  if (exists.rows.length) await q('UPDATE users SET name=$1,role=$2,client_id=$3 WHERE email=$4', [name, role, clientId, email]);
+  else await q('INSERT INTO users(name,email,pass_hash,role,client_id) VALUES($1,$2,$3,$4,$5)', [name, email, '', role, clientId]);
   res.json({ ok: true });
 }));
 app.delete('/api/users/:id', auth, ownerOnly, wrap(async (req, res) => {
@@ -164,7 +178,8 @@ app.delete('/api/users/:id', auth, ownerOnly, wrap(async (req, res) => {
   await q('DELETE FROM users WHERE id=$1', [id]); res.json({ ok: true });
 }));
 
-app.use(express.static(path.join(__dirname, 'public')));
+const INDEX = [path.join(__dirname, 'index.html'), path.join(__dirname, 'public', 'index.html')].find(f => fs.existsSync(f));
+app.get('/', (req, res) => res.sendFile(INDEX));
 app.get('/healthz', (req, res) => res.send('ok'));
 
 init().then(() => app.listen(PORT, () => console.log('VZF status on ' + PORT)))
