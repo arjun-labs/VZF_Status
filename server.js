@@ -12,6 +12,7 @@ const GOOGLE_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
 const BASE_URL = (process.env.BASE_URL || 'https://vzf-status.onrender.com').replace(/\/$/, '');
 const crypto = require('crypto');
 const fs = require('fs');
+const SLACK_WEBHOOK = process.env.SLACK_WEBHOOK_URL || '';
 const STATUSES = ['process', 'done', 'pause', 'cancel'];
 
 function makePool() {
@@ -37,6 +38,13 @@ async function init() {
     if (r.rows.length) await q('UPDATE users SET role=$1 WHERE email=$2', ['owner', ADMIN_EMAIL]);
     else await q('INSERT INTO users(name,email,pass_hash,role) VALUES($1,$2,$3,$4)', ['Owner', ADMIN_EMAIL, '', 'owner']);
   }
+}
+
+
+// Slack heads-up (optional). Never blocks or breaks the request if Slack is down.
+function notifySlack(text) {
+  if (!SLACK_WEBHOOK) return;
+  fetch(SLACK_WEBHOOK, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) }).catch(() => {});
 }
 
 const app = express();
@@ -130,6 +138,7 @@ app.put('/api/projects/:id', auth, staffOnly, wrap(async (req, res) => {
   }
   if (typeof req.body.note === 'string') note = req.body.note.slice(0, 500);
   await q('UPDATE projects SET stages=$1, note=$2, updated_at=$3, updated_by=$4 WHERE id=$5', [JSON.stringify(stages), note, Date.now(), req.user.name, id]);
+  if (req.body.stage !== undefined && req.body.status === 'done' && Number(req.body.stage) === 5) notifySlack(`:white_check_mark: *Project delivered* — ${r.rows[0].title} (marked by ${req.user.name})`);
   res.json({ ok: true });
 }));
 app.post('/api/projects', auth, staffOnly, wrap(async (req, res) => {
@@ -150,6 +159,8 @@ app.post('/api/requests', auth, wrap(async (req, res) => {
   const title = String(req.body.title || '').trim().slice(0, 120);
   if (!title) return res.status(400).json({ error: 'missing' });
   await q('INSERT INTO requests(client_id,title,details,created_at) VALUES($1,$2,$3,$4)', [req.user.client_id, title, String(req.body.details || '').slice(0, 300), Date.now()]);
+  const c = await q('SELECT name FROM clients WHERE id=$1', [req.user.client_id]);
+  notifySlack(`:new: *Nayi project request* — ${title}\nClient: ${c.rows[0] ? c.rows[0].name : req.user.name}${req.body.details ? '\nNote: ' + String(req.body.details).slice(0, 200) : ''}\nProject banane ke liye kholein: ${BASE_URL}`);
   res.json({ ok: true });
 }));
 
